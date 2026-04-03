@@ -217,7 +217,7 @@ def pair_teams_best_effort(team_ids, played_pairs):
         second = team_ids[i]
         pair_key = tuple(sorted((first, second)))
         if pair_key not in played_pairs:
-            rest = team_ids[1:i] + team_ids[i + 1 :]
+            rest = team_ids[1:i] + team_ids[i + 1:]
             return [(first, second)] + pair_teams_best_effort(rest, played_pairs)
 
     second = team_ids[1]
@@ -416,42 +416,86 @@ def get_head_to_head_winner(session_id, team_a_id, team_b_id):
     return None
 
 
-def determine_overall_winners(session_id, standings):
-    if not standings:
-        return []
+def get_tied_groups_by_record(standings):
+    grouped = {}
+    for team_id, stats in standings.items():
+        key = (stats["wins"], stats["losses"])
+        grouped.setdefault(key, []).append(team_id)
 
-    max_wins = max(v["wins"] for v in standings.values())
-    tied = [team_id for team_id, stats in standings.items() if stats["wins"] == max_wins]
+    keys_sorted = sorted(grouped.keys(), key=lambda x: (-x[0], x[1]))
+    return [(key, grouped[key]) for key in keys_sorted]
 
-    if len(tied) == 1:
-        return tied
 
-    if len(tied) == 2:
-        h2h_winner = get_head_to_head_winner(session_id, tied[0], tied[1])
-        if h2h_winner in tied:
-            return [h2h_winner]
-        return tied
+def rank_tied_group(session_id, tied_team_ids):
+    if len(tied_team_ids) == 1:
+        return [tied_team_ids]
 
-    h2h_wins = {team_id: 0 for team_id in tied}
+    if len(tied_team_ids) == 2:
+        winner = get_head_to_head_winner(session_id, tied_team_ids[0], tied_team_ids[1])
+        if winner == tied_team_ids[0]:
+            return [[tied_team_ids[0]], [tied_team_ids[1]]]
+        if winner == tied_team_ids[1]:
+            return [[tied_team_ids[1]], [tied_team_ids[0]]]
+        return [tied_team_ids]
+
+    h2h_wins = {team_id: 0 for team_id in tied_team_ids}
     resolved_matches = 0
 
-    for i in range(len(tied)):
-        for j in range(i + 1, len(tied)):
-            winner = get_head_to_head_winner(session_id, tied[i], tied[j])
+    for i in range(len(tied_team_ids)):
+        for j in range(i + 1, len(tied_team_ids)):
+            winner = get_head_to_head_winner(session_id, tied_team_ids[i], tied_team_ids[j])
             if winner in h2h_wins:
                 h2h_wins[winner] += 1
                 resolved_matches += 1
 
     if resolved_matches == 0:
-        return tied
+        return [tied_team_ids]
 
-    max_h2h = max(h2h_wins.values())
-    leaders = [team_id for team_id, wins in h2h_wins.items() if wins == max_h2h]
+    buckets = {}
+    for team_id, wins in h2h_wins.items():
+        buckets.setdefault(wins, []).append(team_id)
 
-    if len(leaders) == 1:
-        return leaders
+    bucket_keys = sorted(buckets.keys(), reverse=True)
 
-    return tied
+    if len(bucket_keys) == 1:
+        return [tied_team_ids]
+
+    ranked_groups = []
+    for key in bucket_keys:
+        members = buckets[key]
+        ranked_groups.append(members)
+    return ranked_groups
+
+
+def build_ranked_leaderboard_rows(session_id, standings, active_team_lookup, profile_lookup):
+    ranked_rows = []
+    next_rank = 1
+
+    for _, tied_team_ids in get_tied_groups_by_record(standings):
+        ranked_groups = rank_tied_group(session_id, tied_team_ids)
+
+        for group in ranked_groups:
+            group_rows = []
+            for team_id in group:
+                team_row = active_team_lookup.get(team_id)
+                if not team_row:
+                    continue
+                stats = standings[team_id]
+                group_rows.append(
+                    {
+                        "Rank": next_rank,
+                        "Team": get_team_name(team_row, profile_lookup),
+                        "Wins": stats["wins"],
+                        "Losses": stats["losses"],
+                        "Played": stats["played"],
+                    }
+                )
+
+            group_rows.sort(key=lambda x: x["Team"])
+            ranked_rows.extend(group_rows)
+            next_rank += len(group_rows)
+
+    return ranked_rows
 
 
 def build_matchups_table(round_matchups, team_lookup, profile_lookup):
@@ -712,6 +756,8 @@ if view == "About":
 # Registration view
 # =========================
 elif view == "Registration":
+    promote_accepted_teams(session_id)
+
     incoming_requests = (
         supabase.table("pending_teams")
         .select("*")
@@ -968,16 +1014,45 @@ elif view == "Registration":
                     .execute()
                 )
 
-                supabase.table("pending_teams").insert(
-                    {
-                        "session_id": session_id,
-                        "player_1_id": user_id,
-                        "player_2_id": partner_id,
-                        "request_status": "Pending",
-                        "is_paid": False,
-                    }
-                ).execute()
+                reverse_request = (
+                    supabase.table("pending_teams")
+                    .select("*")
+                    .eq("session_id", session_id)
+                    .eq("player_1_id", partner_id)
+                    .eq("player_2_id", user_id)
+                    .execute()
+                    .data
+                )
 
+                if reverse_request:
+                    reverse_id = reverse_request[0]["id"]
+
+                    (
+                        supabase.table("pending_teams")
+                        .update({"request_status": "Accepted"})
+                        .eq("id", reverse_id)
+                        .execute()
+                    )
+
+                    (
+                        supabase.table("players_looking_for_partner")
+                        .delete()
+                        .eq("session_id", session_id)
+                        .eq("user_id", partner_id)
+                        .execute()
+                    )
+                else:
+                    supabase.table("pending_teams").insert(
+                        {
+                            "session_id": session_id,
+                            "player_1_id": user_id,
+                            "player_2_id": partner_id,
+                            "request_status": "Pending",
+                            "is_paid": False,
+                        }
+                    ).execute()
+
+            promote_accepted_teams(session_id)
             st.session_state["show_register"] = False
             st.rerun()
 
@@ -1053,7 +1128,6 @@ elif view == "Matchups":
 
     standings, active_team_lookup = compute_standings(session_id)
     team_lookup = get_registered_team_lookup(session_id)
-    current_winner_ids = determine_overall_winners(session_id, standings)
 
     current_round = next(r for r in rounds if r["round_number"] == current_round_number)
     current_round_matchups = get_matchups_for_round(current_round["id"])
@@ -1140,31 +1214,13 @@ elif view == "Matchups":
 
     st.subheader("Leaderboard")
 
-    leaderboard_rows = []
-    for team_id, stats in standings.items():
-        team_row = active_team_lookup.get(team_id)
-        if not team_row:
-            continue
-
-        leaderboard_rows.append(
-            {
-                "Team": get_team_name(team_row, profile_lookup),
-                "Wins": stats["wins"],
-                "Losses": stats["losses"],
-                "Played": stats["played"],
-            }
-        )
-
-    leaderboard_rows.sort(key=lambda x: (-x["Wins"], x["Losses"], x["Team"]))
-    st.table(build_df(leaderboard_rows, ["Team", "Wins", "Losses", "Played"]))
-
-    if current_winner_ids:
-        current_winners_text = ", ".join(
-            get_team_name(active_team_lookup[team_id], profile_lookup)
-            for team_id in current_winner_ids
-            if team_id in active_team_lookup
-        )
-        st.write(f"Current winner(s): {current_winners_text}")
+    leaderboard_rows = build_ranked_leaderboard_rows(
+        session_id,
+        standings,
+        active_team_lookup,
+        profile_lookup,
+    )
+    st.table(build_df(leaderboard_rows, ["Rank", "Team", "Wins", "Losses", "Played"]))
 
     selected_round_number = st.radio(
         "Round",
