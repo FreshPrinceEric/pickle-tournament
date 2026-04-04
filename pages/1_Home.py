@@ -613,6 +613,16 @@ with st.sidebar:
         st.switch_page("pages/2_Create_Account.py")
 
     if st.button("Logout"):
+        import extra_streamlit_components as stx
+
+        cookie_manager = stx.CookieManager()
+        cookie_manager.delete("pb_refresh_token")
+
+        try:
+            supabase.auth.sign_out()
+        except Exception:
+            pass
+
         st.session_state.clear()
         st.switch_page("app.py")
 
