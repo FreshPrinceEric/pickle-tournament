@@ -32,8 +32,24 @@ def now_phoenix():
 
 
 def get_session():
-    rows = supabase.table("sessions").select("*").limit(1).execute().data
-    return rows[0] if rows else None
+    rows = supabase.table("sessions").select("*").execute().data
+    if not rows:
+        return None
+
+    def session_dt(row):
+        return parse_session_start(row["session_date"], row["start_time"]).replace(
+            tzinfo=ZoneInfo("America/Phoenix")
+        )
+
+    now_dt = now_phoenix()
+    upcoming = [row for row in rows if session_dt(row) >= now_dt]
+
+    if upcoming:
+        upcoming.sort(key=session_dt)
+        return upcoming[0]
+
+    rows.sort(key=session_dt, reverse=True)
+    return rows[0]
 
 
 def get_profiles():
@@ -323,7 +339,7 @@ def generate_round(session_id, round_number):
     return round_row
 
 
-def maybe_generate_rounds(session_id):
+def maybe_generate_rounds(session_id, max_rounds):
     rounds = get_existing_rounds(session_id)
     active_teams = get_active_registered_teams(session_id)
 
@@ -346,7 +362,7 @@ def maybe_generate_rounds(session_id):
             break
 
         next_round = current_round["round_number"] + 1
-        if next_round > 7:
+        if next_round > max_rounds:
             break
 
         if any(r["round_number"] == next_round for r in rounds):
@@ -409,9 +425,11 @@ def promote_accepted_teams(session_id):
         )
 
 
-def get_head_to_head_winner(session_id, team_a_id, team_b_id):
-    matchups = get_all_matchups(session_id)
-    for m in matchups:
+def get_head_to_head_record(session_id, team_a_id, team_b_id):
+    team_a_wins = 0
+    team_b_wins = 0
+
+    for m in get_all_matchups(session_id):
         if m["status"] != "Finished":
             continue
 
@@ -421,9 +439,13 @@ def get_head_to_head_winner(session_id, team_a_id, team_b_id):
             continue
 
         if {t1, t2} == {team_a_id, team_b_id}:
-            return m.get("winner_team_id")
+            winner = m.get("winner_team_id")
+            if winner == team_a_id:
+                team_a_wins += 1
+            elif winner == team_b_id:
+                team_b_wins += 1
 
-    return None
+    return team_a_wins, team_b_wins
 
 
 def get_tied_groups_by_record(standings):
@@ -441,25 +463,37 @@ def rank_tied_group(session_id, tied_team_ids):
         return [tied_team_ids]
 
     if len(tied_team_ids) == 2:
-        winner = get_head_to_head_winner(session_id, tied_team_ids[0], tied_team_ids[1])
-        if winner == tied_team_ids[0]:
-            return [[tied_team_ids[0]], [tied_team_ids[1]]]
-        if winner == tied_team_ids[1]:
-            return [[tied_team_ids[1]], [tied_team_ids[0]]]
-        return [tied_team_ids]
+        team_a = tied_team_ids[0]
+        team_b = tied_team_ids[1]
+
+        team_a_wins, team_b_wins = get_head_to_head_record(session_id, team_a, team_b)
+
+        if team_a_wins > team_b_wins:
+            return [[team_a], [team_b]]
+        if team_b_wins > team_a_wins:
+            return [[team_b], [team_a]]
+
+        return [sorted(tied_team_ids)]
 
     h2h_wins = {team_id: 0 for team_id in tied_team_ids}
-    resolved_matches = 0
+    resolved_pairs = 0
 
     for i in range(len(tied_team_ids)):
         for j in range(i + 1, len(tied_team_ids)):
-            winner = get_head_to_head_winner(session_id, tied_team_ids[i], tied_team_ids[j])
-            if winner in h2h_wins:
-                h2h_wins[winner] += 1
-                resolved_matches += 1
+            team_a = tied_team_ids[i]
+            team_b = tied_team_ids[j]
 
-    if resolved_matches == 0:
-        return [tied_team_ids]
+            team_a_wins, team_b_wins = get_head_to_head_record(session_id, team_a, team_b)
+
+            if team_a_wins > team_b_wins:
+                h2h_wins[team_a] += 1
+                resolved_pairs += 1
+            elif team_b_wins > team_a_wins:
+                h2h_wins[team_b] += 1
+                resolved_pairs += 1
+
+    if resolved_pairs == 0:
+        return [sorted(tied_team_ids)]
 
     buckets = {}
     for team_id, wins in h2h_wins.items():
@@ -468,12 +502,12 @@ def rank_tied_group(session_id, tied_team_ids):
     bucket_keys = sorted(buckets.keys(), reverse=True)
 
     if len(bucket_keys) == 1:
-        return [tied_team_ids]
+        return [sorted(tied_team_ids)]
 
     ranked_groups = []
     for key in bucket_keys:
-        members = buckets[key]
-        ranked_groups.append(members)
+        ranked_groups.append(sorted(buckets[key]))
+
     return ranked_groups
 
 
@@ -568,6 +602,7 @@ session_start_dt = parse_session_start(session["session_date"], session["start_t
 session_started = now_dt >= session_start_dt
 matchups_available = session_started
 registration_locked = now_dt >= session_start_dt
+max_rounds = int(session.get("number_of_rounds") or 7)
 
 with st.sidebar:
     st.subheader("Profile")
@@ -725,11 +760,14 @@ if view == "About":
     ### Tie Breaker Rules
 
     If two teams are tied:
-    - The winner of the **head-to-head matchup** wins
+    - The better combined **head-to-head record** wins
 
-    If three or more teams are tied and head-to-head results form a cycle:
-    - (Example: A beat B, B beat C, C beat A)
-    - Then **all tied teams are considered winners**
+    If the head-to-head record is tied:
+    - The teams remain tied
+
+    If three or more teams are tied:
+    - The app compares combined head-to-head results within the tied group
+    - If that still does not break the tie, the teams remain tied
 
     ---
 
@@ -771,6 +809,59 @@ elif view == "Registration":
 
     if registration_locked:
         st.warning("Registration is closed. The session has started.")
+
+    action_col1, action_col2, action_col3, action_col4 = st.columns(4)
+
+    if action_col1.button("Register", use_container_width=True, disabled=registration_locked):
+        st.session_state["show_register"] = True
+        st.session_state["show_add_court"] = False
+        st.rerun()
+
+    if action_col2.button("Add Court", use_container_width=True, disabled=registration_locked):
+        st.session_state["show_add_court"] = True
+        st.session_state["show_register"] = False
+        st.rerun()
+
+    if action_col3.button("Clear Bookings", use_container_width=True, disabled=registration_locked):
+        if registration_locked:
+            st.error("Registration is closed.")
+            st.stop()
+
+        (
+            supabase.table("booked_courts")
+            .delete()
+            .eq("session_id", session_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+        promote_accepted_teams(session_id)
+        st.rerun()
+
+    if action_col4.button("Withdraw", use_container_width=True, disabled=registration_locked):
+        if registration_locked:
+            st.error("Registration is closed.")
+            st.stop()
+
+        (
+            supabase.table("players_looking_for_partner")
+            .delete()
+            .eq("session_id", session_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+
+        (
+            supabase.table("pending_teams")
+            .delete()
+            .eq("session_id", session_id)
+            .or_(f"player_1_id.eq.{user_id},player_2_id.eq.{user_id}")
+            .execute()
+        )
+
+        st.session_state["show_register"] = False
+        st.session_state["show_add_court"] = False
+        promote_accepted_teams(session_id)
+        st.rerun()
 
     incoming_requests = (
         supabase.table("pending_teams")
@@ -976,11 +1067,6 @@ elif view == "Registration":
         st.session_state["show_register"] = False
         st.session_state["show_add_court"] = False
 
-    if st.button("Register", disabled=registration_locked):
-        st.session_state["show_register"] = True
-        st.session_state["show_add_court"] = False
-        st.rerun()
-
     if st.session_state["show_register"] and not registration_locked:
         registered_rows = get_active_registered_teams(session_id)
 
@@ -1090,11 +1176,6 @@ elif view == "Registration":
             st.session_state["show_register"] = False
             st.rerun()
 
-    if st.button("Add Court", disabled=registration_locked):
-        st.session_state["show_add_court"] = True
-        st.session_state["show_register"] = False
-        st.rerun()
-
     if st.session_state["show_add_court"] and not registration_locked:
         if available:
             selected_court = st.selectbox("Court", available)
@@ -1117,52 +1198,11 @@ elif view == "Registration":
         else:
             st.info("No courts available.")
 
-    if st.button("Clear Bookings", disabled=registration_locked):
-        if registration_locked:
-            st.error("Registration is closed.")
-            st.stop()
-
-        (
-            supabase.table("booked_courts")
-            .delete()
-            .eq("session_id", session_id)
-            .eq("user_id", user_id)
-            .execute()
-        )
-        promote_accepted_teams(session_id)
-        st.rerun()
-
-    if st.button("Withdraw", disabled=registration_locked):
-        if registration_locked:
-            st.error("Registration is closed.")
-            st.stop()
-
-        (
-            supabase.table("players_looking_for_partner")
-            .delete()
-            .eq("session_id", session_id)
-            .eq("user_id", user_id)
-            .execute()
-        )
-
-        (
-            supabase.table("pending_teams")
-            .delete()
-            .eq("session_id", session_id)
-            .or_(f"player_1_id.eq.{user_id},player_2_id.eq.{user_id}")
-            .execute()
-        )
-
-        st.session_state["show_register"] = False
-        st.session_state["show_add_court"] = False
-        promote_accepted_teams(session_id)
-        st.rerun()
-
 # =========================
 # Matchups view
 # =========================
 elif view == "Matchups":
-    maybe_generate_rounds(session_id)
+    maybe_generate_rounds(session_id, max_rounds)
 
     rounds = get_existing_rounds(session_id)
     if not rounds:
@@ -1232,7 +1272,7 @@ elif view == "Matchups":
                         .eq("id", fresh["id"])
                         .execute()
                     )
-                    maybe_generate_rounds(session_id)
+                    maybe_generate_rounds(session_id, max_rounds)
                     st.rerun()
 
             if col2.button("Team 2 Wins", key=f"team2_win_{your_match['id']}"):
@@ -1255,7 +1295,7 @@ elif view == "Matchups":
                         .eq("id", fresh["id"])
                         .execute()
                     )
-                    maybe_generate_rounds(session_id)
+                    maybe_generate_rounds(session_id, max_rounds)
                     st.rerun()
 
     st.subheader("Leaderboard")
@@ -1308,7 +1348,7 @@ elif view == "Matchups":
                     .eq("id", selected_match["id"])
                     .execute()
                 )
-                maybe_generate_rounds(session_id)
+                maybe_generate_rounds(session_id, max_rounds)
                 st.rerun()
 
             if col2.button("Set Team 2 Win"):
@@ -1323,7 +1363,7 @@ elif view == "Matchups":
                     .eq("id", selected_match["id"])
                     .execute()
                 )
-                maybe_generate_rounds(session_id)
+                maybe_generate_rounds(session_id, max_rounds)
                 st.rerun()
 
     st.subheader("Matchups")
@@ -1334,4 +1374,90 @@ elif view == "Matchups":
 # =========================
 elif view == "Admin":
     st.subheader("Admin")
-    st.write("Admin tools placeholder.")
+
+    st.markdown("### Current Session")
+    st.write(f"Date: {session_date_str}")
+    st.write(f"Start Time: {format_time_12h(session['start_time'])}")
+    st.write(f"Rounds: {max_rounds}")
+
+    st.markdown("### Clear Current Session")
+    st.caption("This clears registration, courts, rounds, and matchups for the current session.")
+
+    if st.button("Clear Session", type="primary"):
+        (
+            supabase.table("matchups")
+            .delete()
+            .eq("session_id", session_id)
+            .execute()
+        )
+
+        (
+            supabase.table("session_rounds")
+            .delete()
+            .eq("session_id", session_id)
+            .execute()
+        )
+
+        (
+            supabase.table("registered_teams")
+            .delete()
+            .eq("session_id", session_id)
+            .execute()
+        )
+
+        (
+            supabase.table("pending_teams")
+            .delete()
+            .eq("session_id", session_id)
+            .execute()
+        )
+
+        (
+            supabase.table("players_looking_for_partner")
+            .delete()
+            .eq("session_id", session_id)
+            .execute()
+        )
+
+        (
+            supabase.table("booked_courts")
+            .delete()
+            .eq("session_id", session_id)
+            .execute()
+        )
+
+        st.session_state["show_register"] = False
+        st.session_state["show_add_court"] = False
+        st.success("Current session cleared.")
+        st.rerun()
+
+    st.markdown("### Create New Session")
+
+    with st.form("create_new_session_form"):
+        new_session_date = st.date_input("Session date")
+        new_session_time = st.time_input("Start time")
+        new_session_rounds = st.number_input(
+            "Number of rounds",
+            min_value=1,
+            max_value=20,
+            value=7,
+            step=1,
+        )
+
+        create_session = st.form_submit_button("Create New Session")
+
+    if create_session:
+        (
+            supabase.table("sessions")
+            .insert(
+                {
+                    "session_date": new_session_date.isoformat(),
+                    "start_time": new_session_time.strftime("%H:%M:%S"),
+                    "number_of_rounds": int(new_session_rounds),
+                }
+            )
+            .execute()
+        )
+
+        st.success("New session created.")
+        st.rerun()
