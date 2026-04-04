@@ -810,6 +810,17 @@ elif view == "Registration":
     if registration_locked:
         st.warning("Registration is closed. The session has started.")
 
+    courts = get_booked_courts(session_id)
+    booked_numbers = {r["court_number"] for r in courts}
+    available = [i for i in range(1, 17) if i not in booked_numbers]
+
+    st.session_state.setdefault("show_register", False)
+    st.session_state.setdefault("show_add_court", False)
+
+    if registration_locked:
+        st.session_state["show_register"] = False
+        st.session_state["show_add_court"] = False
+
     action_col1, action_col2, action_col3, action_col4 = st.columns(4)
 
     if action_col1.button("Register", use_container_width=True, disabled=registration_locked):
@@ -862,6 +873,139 @@ elif view == "Registration":
         st.session_state["show_add_court"] = False
         promote_accepted_teams(session_id)
         st.rerun()
+
+    if st.session_state["show_register"] and not registration_locked:
+        registered_rows = get_active_registered_teams(session_id)
+
+        accepted_rows = (
+            supabase.table("pending_teams")
+            .select("*")
+            .eq("session_id", session_id)
+            .eq("request_status", "Accepted")
+            .execute()
+            .data
+        )
+
+        unavailable_ids = set()
+
+        for r in registered_rows:
+            unavailable_ids.add(r["player_1_id"])
+            unavailable_ids.add(r["player_2_id"])
+
+        for r in accepted_rows:
+            unavailable_ids.add(r["player_1_id"])
+            unavailable_ids.add(r["player_2_id"])
+
+        eligible_partners = {
+            pid: get_full_name(pid, profile_lookup)
+            for pid, v in profile_lookup.items()
+            if pid != user_id and pid not in unavailable_ids and v["name"]
+        }
+
+        options = ["No partner / Looking for partner"] + sorted(eligible_partners.values())
+
+        st.subheader("Register")
+        selected_name = st.selectbox("Partner", options)
+
+        if st.button("Submit Registration", disabled=registration_locked):
+            if registration_locked:
+                st.error("Registration is closed.")
+                st.stop()
+
+            (
+                supabase.table("players_looking_for_partner")
+                .delete()
+                .eq("session_id", session_id)
+                .eq("user_id", user_id)
+                .execute()
+            )
+
+            if selected_name == "No partner / Looking for partner":
+                supabase.table("players_looking_for_partner").insert(
+                    {
+                        "session_id": session_id,
+                        "user_id": user_id,
+                    }
+                ).execute()
+            else:
+                partner_id = next(
+                    pid for pid, name in eligible_partners.items()
+                    if name == selected_name
+                )
+
+                (
+                    supabase.table("pending_teams")
+                    .delete()
+                    .eq("session_id", session_id)
+                    .eq("player_1_id", user_id)
+                    .execute()
+                )
+
+                reverse_request = (
+                    supabase.table("pending_teams")
+                    .select("*")
+                    .eq("session_id", session_id)
+                    .eq("player_1_id", partner_id)
+                    .eq("player_2_id", user_id)
+                    .execute()
+                    .data
+                )
+
+                if reverse_request:
+                    reverse_id = reverse_request[0]["id"]
+
+                    (
+                        supabase.table("pending_teams")
+                        .update({"request_status": "Accepted"})
+                        .eq("id", reverse_id)
+                        .execute()
+                    )
+
+                    (
+                        supabase.table("players_looking_for_partner")
+                        .delete()
+                        .eq("session_id", session_id)
+                        .eq("user_id", partner_id)
+                        .execute()
+                    )
+                else:
+                    supabase.table("pending_teams").insert(
+                        {
+                            "session_id": session_id,
+                            "player_1_id": user_id,
+                            "player_2_id": partner_id,
+                            "request_status": "Pending",
+                            "is_paid": False,
+                        }
+                    ).execute()
+
+            promote_accepted_teams(session_id)
+            st.session_state["show_register"] = False
+            st.rerun()
+
+    if st.session_state["show_add_court"] and not registration_locked:
+        st.subheader("Add Court")
+
+        if available:
+            selected_court = st.selectbox("Court", available)
+
+            if st.button("Submit Court", disabled=registration_locked):
+                if registration_locked:
+                    st.error("Registration is closed.")
+                    st.stop()
+
+                supabase.table("booked_courts").insert(
+                    {
+                        "session_id": session_id,
+                        "user_id": user_id,
+                        "court_number": selected_court,
+                    }
+                ).execute()
+
+                promote_accepted_teams(session_id)
+                st.rerun()
+        else:
+            st.info("No courts available.")
 
     incoming_requests = (
         supabase.table("pending_teams")
@@ -1056,147 +1200,6 @@ elif view == "Registration":
             ["Court", "Player"],
         )
     )
-
-    booked_numbers = {r["court_number"] for r in courts}
-    available = [i for i in range(1, 17) if i not in booked_numbers]
-
-    st.session_state.setdefault("show_register", False)
-    st.session_state.setdefault("show_add_court", False)
-
-    if registration_locked:
-        st.session_state["show_register"] = False
-        st.session_state["show_add_court"] = False
-
-    if st.session_state["show_register"] and not registration_locked:
-        registered_rows = get_active_registered_teams(session_id)
-
-        accepted_rows = (
-            supabase.table("pending_teams")
-            .select("*")
-            .eq("session_id", session_id)
-            .eq("request_status", "Accepted")
-            .execute()
-            .data
-        )
-
-        unavailable_ids = set()
-
-        for r in registered_rows:
-            unavailable_ids.add(r["player_1_id"])
-            unavailable_ids.add(r["player_2_id"])
-
-        for r in accepted_rows:
-            unavailable_ids.add(r["player_1_id"])
-            unavailable_ids.add(r["player_2_id"])
-
-        eligible_partners = {
-            pid: get_full_name(pid, profile_lookup)
-            for pid, v in profile_lookup.items()
-            if pid != user_id and pid not in unavailable_ids and v["name"]
-        }
-
-        options = ["No partner / Looking for partner"] + sorted(eligible_partners.values())
-
-        st.subheader("Register")
-        selected_name = st.selectbox("Partner", options)
-
-        if st.button("Submit Registration", disabled=registration_locked):
-            if registration_locked:
-                st.error("Registration is closed.")
-                st.stop()
-
-            (
-                supabase.table("players_looking_for_partner")
-                .delete()
-                .eq("session_id", session_id)
-                .eq("user_id", user_id)
-                .execute()
-            )
-
-            if selected_name == "No partner / Looking for partner":
-                supabase.table("players_looking_for_partner").insert(
-                    {
-                        "session_id": session_id,
-                        "user_id": user_id,
-                    }
-                ).execute()
-            else:
-                partner_id = next(
-                    pid for pid, name in eligible_partners.items()
-                    if name == selected_name
-                )
-
-                (
-                    supabase.table("pending_teams")
-                    .delete()
-                    .eq("session_id", session_id)
-                    .eq("player_1_id", user_id)
-                    .execute()
-                )
-
-                reverse_request = (
-                    supabase.table("pending_teams")
-                    .select("*")
-                    .eq("session_id", session_id)
-                    .eq("player_1_id", partner_id)
-                    .eq("player_2_id", user_id)
-                    .execute()
-                    .data
-                )
-
-                if reverse_request:
-                    reverse_id = reverse_request[0]["id"]
-
-                    (
-                        supabase.table("pending_teams")
-                        .update({"request_status": "Accepted"})
-                        .eq("id", reverse_id)
-                        .execute()
-                    )
-
-                    (
-                        supabase.table("players_looking_for_partner")
-                        .delete()
-                        .eq("session_id", session_id)
-                        .eq("user_id", partner_id)
-                        .execute()
-                    )
-                else:
-                    supabase.table("pending_teams").insert(
-                        {
-                            "session_id": session_id,
-                            "player_1_id": user_id,
-                            "player_2_id": partner_id,
-                            "request_status": "Pending",
-                            "is_paid": False,
-                        }
-                    ).execute()
-
-            promote_accepted_teams(session_id)
-            st.session_state["show_register"] = False
-            st.rerun()
-
-    if st.session_state["show_add_court"] and not registration_locked:
-        if available:
-            selected_court = st.selectbox("Court", available)
-
-            if st.button("Submit Court", disabled=registration_locked):
-                if registration_locked:
-                    st.error("Registration is closed.")
-                    st.stop()
-
-                supabase.table("booked_courts").insert(
-                    {
-                        "session_id": session_id,
-                        "user_id": user_id,
-                        "court_number": selected_court,
-                    }
-                ).execute()
-
-                promote_accepted_teams(session_id)
-                st.rerun()
-        else:
-            st.info("No courts available.")
 
 # =========================
 # Matchups view
@@ -1435,7 +1438,12 @@ elif view == "Admin":
 
     with st.form("create_new_session_form"):
         new_session_date = st.date_input("Session date")
-        new_session_time = st.time_input("Start time")
+
+        time_col1, time_col2, time_col3 = st.columns(3)
+        new_session_hour = time_col1.selectbox("Hour", list(range(1, 13)), index=5)
+        new_session_minute = time_col2.selectbox("Minute", ["00", "30"], index=0)
+        new_session_ampm = time_col3.selectbox("AM/PM", ["AM", "PM"], index=1)
+
         new_session_rounds = st.number_input(
             "Number of rounds",
             min_value=1,
@@ -1447,12 +1455,18 @@ elif view == "Admin":
         create_session = st.form_submit_button("Create New Session")
 
     if create_session:
+        hour_24 = new_session_hour % 12
+        if new_session_ampm == "PM":
+            hour_24 += 12
+
+        start_time_24 = f"{hour_24:02d}:{int(new_session_minute):02d}:00"
+
         (
             supabase.table("sessions")
             .insert(
                 {
                     "session_date": new_session_date.isoformat(),
-                    "start_time": new_session_time.strftime("%H:%M:%S"),
+                    "start_time": start_time_24,
                     "number_of_rounds": int(new_session_rounds),
                 }
             )
