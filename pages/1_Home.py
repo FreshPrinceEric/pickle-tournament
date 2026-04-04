@@ -1,5 +1,6 @@
 import random
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -26,6 +27,10 @@ def parse_session_start(session_date_value, start_time_value):
     return datetime.combine(session_date_obj, session_time_obj)
 
 
+def now_phoenix():
+    return datetime.now(ZoneInfo("America/Phoenix"))
+
+
 def get_session():
     rows = supabase.table("sessions").select("*").limit(1).execute().data
     return rows[0] if rows else None
@@ -49,6 +54,11 @@ def get_profiles():
 def get_first_name(user_id, profile_lookup):
     first_name = profile_lookup.get(user_id, {}).get("first_name", "").strip()
     return first_name if first_name else "Unknown"
+
+
+def get_full_name(user_id, profile_lookup):
+    full_name = profile_lookup.get(user_id, {}).get("name", "").strip()
+    return full_name if full_name else "Unknown"
 
 
 def get_active_registered_teams(session_id):
@@ -549,9 +559,11 @@ session_date_str = str(session["session_date"])
 today_str = date.today().isoformat()
 about_acknowledged = profile_lookup.get(user_id, {}).get("about_acknowledged", False)
 
-session_start_dt = parse_session_start(session["session_date"], session["start_time"])
+session_start_dt = parse_session_start(session["session_date"], session["start_time"]).replace(
+    tzinfo=ZoneInfo("America/Phoenix")
+)
 matchups_unlock_dt = session_start_dt - timedelta(hours=1)
-matchups_unlocked = is_admin or datetime.now() >= matchups_unlock_dt
+matchups_unlocked = is_admin or now_phoenix() >= matchups_unlock_dt
 
 with st.sidebar:
     st.subheader("Profile")
@@ -772,7 +784,7 @@ elif view == "Registration":
         st.subheader("Partner Requests")
 
         for req in incoming_requests:
-            requester = get_first_name(req["player_1_id"], profile_lookup)
+            requester = get_full_name(req["player_1_id"], profile_lookup)
             st.write(f"{requester} requested you")
 
             col1, col2 = st.columns(2)
@@ -844,7 +856,7 @@ elif view == "Registration":
         build_df(
             [
                 {
-                    "Player": get_first_name(r["user_id"], profile_lookup),
+                    "Player": get_full_name(r["user_id"], profile_lookup),
                     "Phone": profile_lookup[r["user_id"]]["phone"],
                 }
                 for r in looking
@@ -873,7 +885,7 @@ elif view == "Registration":
             team_labels = []
 
             for row in accepted_unapproved:
-                label = f"{get_first_name(row['player_1_id'], profile_lookup)} / {get_first_name(row['player_2_id'], profile_lookup)}"
+                label = f"{get_full_name(row['player_1_id'], profile_lookup)} / {get_full_name(row['player_2_id'], profile_lookup)}"
                 team_labels.append(label)
                 team_label_to_id[label] = row["id"]
 
@@ -898,8 +910,8 @@ elif view == "Registration":
         build_df(
             [
                 {
-                    "Player 1": get_first_name(r["player_1_id"], profile_lookup),
-                    "Player 2": get_first_name(r["player_2_id"], profile_lookup),
+                    "Player 1": get_full_name(r["player_1_id"], profile_lookup),
+                    "Player 2": get_full_name(r["player_2_id"], profile_lookup),
                     "Request": r["request_status"],
                 }
                 for r in pending
@@ -915,8 +927,8 @@ elif view == "Registration":
         build_df(
             [
                 {
-                    "Player 1": get_first_name(r["player_1_id"], profile_lookup),
-                    "Player 2": get_first_name(r["player_2_id"], profile_lookup),
+                    "Player 1": get_full_name(r["player_1_id"], profile_lookup),
+                    "Player 2": get_full_name(r["player_2_id"], profile_lookup),
                 }
                 for r in registered
             ],
@@ -932,7 +944,7 @@ elif view == "Registration":
             [
                 {
                     "Court": r["court_number"],
-                    "Player": get_first_name(r["user_id"], profile_lookup),
+                    "Player": get_full_name(r["user_id"], profile_lookup),
                 }
                 for r in courts
             ],
@@ -974,7 +986,7 @@ elif view == "Registration":
             unavailable_ids.add(r["player_2_id"])
 
         eligible_partners = {
-            pid: get_first_name(pid, profile_lookup)
+            pid: get_full_name(pid, profile_lookup)
             for pid, v in profile_lookup.items()
             if pid != user_id and pid not in unavailable_ids and v["name"]
         }
