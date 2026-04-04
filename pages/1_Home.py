@@ -760,7 +760,7 @@ if view == "About":
             .execute()
         )
 
-        st.session_state["home_view"] = "Registration"
+        st.session_state.pop("home_view", None)
         st.rerun()
 
 # =========================
