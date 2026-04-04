@@ -1,5 +1,5 @@
 import random
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -556,14 +556,18 @@ current_user_email = (st.session_state.get("user") or "").strip().lower()
 is_admin = current_user_email == "epcepress@gmail.com"
 
 session_date_str = str(session["session_date"])
-today_str = date.today().isoformat()
 about_acknowledged = profile_lookup.get(user_id, {}).get("about_acknowledged", False)
+
+now_dt = now_phoenix()
+today_str = now_dt.date().isoformat()
 
 session_start_dt = parse_session_start(session["session_date"], session["start_time"]).replace(
     tzinfo=ZoneInfo("America/Phoenix")
 )
-matchups_unlock_dt = session_start_dt - timedelta(hours=1)
-matchups_unlocked = is_admin or now_phoenix() >= matchups_unlock_dt
+
+session_started = now_dt >= session_start_dt
+matchups_available = is_admin or session_started
+registration_locked = now_dt >= session_start_dt
 
 with st.sidebar:
     st.subheader("Profile")
@@ -583,13 +587,14 @@ nav_options = ["About", "Registration", "Matchups"]
 if is_admin:
     nav_options.append("Admin")
 
+default_view = "Registration"
+if not about_acknowledged:
+    default_view = "About"
+elif today_str == session_date_str and session_started:
+    default_view = "Matchups"
+
 if "home_view" not in st.session_state or st.session_state["home_view"] not in nav_options:
-    if not about_acknowledged:
-        st.session_state["home_view"] = "About"
-    elif matchups_unlocked and today_str == session_date_str:
-        st.session_state["home_view"] = "Matchups"
-    else:
-        st.session_state["home_view"] = "Registration"
+    st.session_state["home_view"] = default_view
 
 view = st.radio(
     "View",
@@ -604,10 +609,10 @@ if not about_acknowledged and view != "About":
     view = "About"
     st.warning("Please read and acknowledge the About page before using Registration or Matchups.")
 
-if about_acknowledged and view == "Matchups" and not matchups_unlocked:
+if about_acknowledged and view == "Matchups" and not matchups_available:
     st.session_state["home_view"] = "Registration"
     view = "Registration"
-    st.warning("Matchups will be generated 1 hour before the start time.")
+    st.warning("Matchups will be available at the session start time.")
 
 # =========================
 # About view
@@ -757,7 +762,7 @@ if view == "About":
             .execute()
         )
 
-        if matchups_unlocked and today_str == session_date_str:
+        if today_str == session_date_str and session_started:
             st.session_state["home_view"] = "Matchups"
         else:
             st.session_state["home_view"] = "Registration"
@@ -769,6 +774,9 @@ if view == "About":
 # =========================
 elif view == "Registration":
     promote_accepted_teams(session_id)
+
+    if registration_locked:
+        st.warning("Registration is closed. The session has started.")
 
     incoming_requests = (
         supabase.table("pending_teams")
@@ -789,7 +797,11 @@ elif view == "Registration":
 
             col1, col2 = st.columns(2)
 
-            if col1.button("Accept", key=f"accept_{req['id']}"):
+            if col1.button("Accept", key=f"accept_{req['id']}", disabled=registration_locked):
+                if registration_locked:
+                    st.error("Registration is closed.")
+                    st.stop()
+
                 (
                     supabase.table("pending_teams")
                     .update({"request_status": "Accepted"})
@@ -834,7 +846,11 @@ elif view == "Registration":
 
                 st.rerun()
 
-            if col2.button("Reject", key=f"reject_{req['id']}"):
+            if col2.button("Reject", key=f"reject_{req['id']}", disabled=registration_locked):
+                if registration_locked:
+                    st.error("Registration is closed.")
+                    st.stop()
+
                 (
                     supabase.table("pending_teams")
                     .delete()
@@ -894,7 +910,11 @@ elif view == "Registration":
                 ["Select team"] + team_labels,
             )
 
-            if st.button("Approve Team"):
+            if st.button("Approve Team", disabled=registration_locked):
+                if registration_locked:
+                    st.error("Registration is closed.")
+                    st.stop()
+
                 if selected_unapproved_team != "Select team":
                     (
                         supabase.table("pending_teams")
@@ -958,12 +978,16 @@ elif view == "Registration":
     st.session_state.setdefault("show_register", False)
     st.session_state.setdefault("show_add_court", False)
 
-    if st.button("Register"):
+    if registration_locked:
+        st.session_state["show_register"] = False
+        st.session_state["show_add_court"] = False
+
+    if st.button("Register", disabled=registration_locked):
         st.session_state["show_register"] = True
         st.session_state["show_add_court"] = False
         st.rerun()
 
-    if st.session_state["show_register"]:
+    if st.session_state["show_register"] and not registration_locked:
         registered_rows = get_active_registered_teams(session_id)
 
         accepted_rows = (
@@ -996,7 +1020,11 @@ elif view == "Registration":
         st.subheader("Register")
         selected_name = st.selectbox("Partner", options)
 
-        if st.button("Submit Registration"):
+        if st.button("Submit Registration", disabled=registration_locked):
+            if registration_locked:
+                st.error("Registration is closed.")
+                st.stop()
+
             (
                 supabase.table("players_looking_for_partner")
                 .delete()
@@ -1068,16 +1096,20 @@ elif view == "Registration":
             st.session_state["show_register"] = False
             st.rerun()
 
-    if st.button("Add Court"):
+    if st.button("Add Court", disabled=registration_locked):
         st.session_state["show_add_court"] = True
         st.session_state["show_register"] = False
         st.rerun()
 
-    if st.session_state["show_add_court"]:
+    if st.session_state["show_add_court"] and not registration_locked:
         if available:
             selected_court = st.selectbox("Court", available)
 
-            if st.button("Submit Court"):
+            if st.button("Submit Court", disabled=registration_locked):
+                if registration_locked:
+                    st.error("Registration is closed.")
+                    st.stop()
+
                 supabase.table("booked_courts").insert(
                     {
                         "session_id": session_id,
@@ -1091,7 +1123,11 @@ elif view == "Registration":
         else:
             st.info("No courts available.")
 
-    if st.button("Clear Bookings"):
+    if st.button("Clear Bookings", disabled=registration_locked):
+        if registration_locked:
+            st.error("Registration is closed.")
+            st.stop()
+
         (
             supabase.table("booked_courts")
             .delete()
@@ -1102,7 +1138,11 @@ elif view == "Registration":
         promote_accepted_teams(session_id)
         st.rerun()
 
-    if st.button("Withdraw"):
+    if st.button("Withdraw", disabled=registration_locked):
+        if registration_locked:
+            st.error("Registration is closed.")
+            st.stop()
+
         (
             supabase.table("players_looking_for_partner")
             .delete()
