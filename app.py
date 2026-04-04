@@ -1,3 +1,4 @@
+import time
 import streamlit as st
 import extra_streamlit_components as stx
 
@@ -12,10 +13,10 @@ def get_cookie_manager():
     return st.session_state["cookie_manager"]
 
 
-def set_auth_state(session):
+def set_auth_state(user):
     st.session_state.authenticated = True
-    st.session_state.user = session.user.email
-    st.session_state.user_id = session.user.id
+    st.session_state.user = user.email
+    st.session_state.user_id = user.id
 
 
 def clear_auth_state():
@@ -29,15 +30,21 @@ def try_restore_session():
         return
 
     cookie_manager = get_cookie_manager()
-    refresh_token = cookie_manager.get(COOKIE_NAME)
+
+    # Give the cookie component time to populate on first render
+    time.sleep(0.2)
+    cookies = cookie_manager.get_all()
+    refresh_token = cookies.get(COOKIE_NAME)
 
     if not refresh_token:
         return
 
     try:
         response = supabase.auth.refresh_session(refresh_token)
+
         if response.session is not None and response.user is not None:
-            set_auth_state(response)
+            set_auth_state(response.user)
+
             cookie_manager.set(
                 COOKIE_NAME,
                 response.session.refresh_token,
@@ -52,12 +59,13 @@ def try_restore_session():
         clear_auth_state()
 
 
+st.title("Login")
+
+cookie_manager = get_cookie_manager()
 try_restore_session()
 
 if st.session_state.get("authenticated"):
     st.switch_page("pages/1_Home.py")
-
-st.title("Login")
 
 email = st.text_input("Email")
 password = st.text_input("Password", type="password")
@@ -70,20 +78,21 @@ if st.button("Login"):
             response = supabase.auth.sign_in_with_password(
                 {
                     "email": email,
-                    "password": password,
+                    "password": password
                 }
             )
 
             if response.session is not None and response.user is not None:
-                set_auth_state(response)
+                set_auth_state(response.user)
 
-                cookie_manager = get_cookie_manager()
                 cookie_manager.set(
                     COOKIE_NAME,
                     response.session.refresh_token,
                     max_age=60 * 60 * 24 * 30,
                 )
 
+                # Give cookie time to write before navigating away
+                time.sleep(0.2)
                 st.switch_page("pages/1_Home.py")
             else:
                 st.error("Invalid email or password.")
