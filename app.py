@@ -6,9 +6,10 @@ from supabase_client import supabase
 COOKIE_NAME = "pb_refresh_token"
 
 
-@st.cache_resource
 def get_cookie_manager():
-    return stx.CookieManager()
+    if "cookie_manager" not in st.session_state:
+        st.session_state["cookie_manager"] = stx.CookieManager()
+    return st.session_state["cookie_manager"]
 
 
 def set_auth_state(session):
