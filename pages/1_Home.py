@@ -605,14 +605,12 @@ view = st.radio(
 )
 
 if not about_acknowledged and view != "About":
-    st.session_state["home_view"] = "About"
-    view = "About"
     st.warning("Please read and acknowledge the About page before using Registration or Matchups.")
+    st.stop()
 
 if about_acknowledged and view == "Matchups" and not matchups_available:
-    st.session_state["home_view"] = "Registration"
-    view = "Registration"
     st.warning("Matchups will be available at the session start time.")
+    st.stop()
 
 # =========================
 # About view
@@ -761,11 +759,6 @@ if view == "About":
             .eq("id", user_id)
             .execute()
         )
-
-        if today_str == session_date_str and session_started:
-            st.session_state["home_view"] = "Matchups"
-        else:
-            st.session_state["home_view"] = "Registration"
 
         st.rerun()
 
