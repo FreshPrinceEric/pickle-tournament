@@ -551,7 +551,7 @@ session_id = session["id"]
 user_id = st.session_state.get("user_id")
 profile_lookup = get_profiles()
 
-current_user_name = get_first_name(user_id, profile_lookup)
+current_user_name = get_full_name(user_id, profile_lookup)
 current_user_email = (st.session_state.get("user") or "").strip().lower()
 is_admin = current_user_email == "epcepress@gmail.com"
 
@@ -566,7 +566,7 @@ session_start_dt = parse_session_start(session["session_date"], session["start_t
 )
 
 session_started = now_dt >= session_start_dt
-matchups_available = is_admin or session_started
+matchups_available = session_started
 registration_locked = now_dt >= session_start_dt
 
 with st.sidebar:
@@ -760,6 +760,7 @@ if view == "About":
             .execute()
         )
 
+        st.session_state["home_view"] = "Registration"
         st.rerun()
 
 # =========================
