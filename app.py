@@ -33,11 +33,12 @@ def perform_logout_if_requested():
     cookie_manager = get_cookie_manager()
 
     clear_auth_state()
+    st.session_state["logged_out"] = True
 
     cookie_manager.set(
         LOGOUT_COOKIE,
         "1",
-        max_age=60 * 60,
+        max_age=60 * 60 * 24 * 7,
         key="logout_set_marker",
     )
     cookie_manager.set(
@@ -55,6 +56,10 @@ def try_restore_session():
     if st.session_state.get("authenticated"):
         return
 
+    if st.session_state.get("logged_out"):
+        clear_auth_state()
+        return
+
     cookie_manager = get_cookie_manager()
 
     time.sleep(0.2)
@@ -62,6 +67,7 @@ def try_restore_session():
 
     if cookies.get(LOGOUT_COOKIE) == "1":
         clear_auth_state()
+        st.session_state["logged_out"] = True
         return
 
     refresh_token = cookies.get(COOKIE_NAME)
@@ -81,12 +87,6 @@ def try_restore_session():
                 response.session.refresh_token,
                 max_age=60 * 60 * 24 * 30,
                 key="restore_set_refresh",
-            )
-            cookie_manager.set(
-                LOGOUT_COOKIE,
-                "",
-                max_age=0,
-                key="restore_clear_logout_marker",
             )
 
             st.rerun()
@@ -134,6 +134,7 @@ if st.button("Login"):
 
             if response.session is not None and response.user is not None:
                 set_auth_state(response.user)
+                st.session_state.pop("logged_out", None)
 
                 cookie_manager.set(
                     COOKIE_NAME,
