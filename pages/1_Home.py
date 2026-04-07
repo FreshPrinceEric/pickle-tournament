@@ -653,6 +653,7 @@ with st.sidebar:
 
     if st.button("Logout"):
         st.session_state["perform_logout"] = True
+        st.session_state["logged_out"] = True
         st.switch_page("app.py")
         st.stop()
 
