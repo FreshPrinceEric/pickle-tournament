@@ -372,7 +372,7 @@ def maybe_generate_rounds(session_id, max_rounds):
         rounds = get_existing_rounds(session_id)
 
 
-def promote_accepted_teams(session_id):
+def promote_accepted_teams(session_id, requires_admin_approval):
     booked_count = len(get_booked_courts(session_id))
     max_teams = booked_count * 2
 
@@ -383,18 +383,24 @@ def promote_accepted_teams(session_id):
     if available_slots <= 0:
         return
 
-    accepted_approved = (
+    pending_rows = (
         supabase.table("pending_teams")
         .select("*")
         .eq("session_id", session_id)
-        .eq("request_status", "Accepted")
-        .eq("is_paid", True)
         .order("created_at")
         .execute()
         .data
     )
 
-    accepted_count = len(accepted_approved)
+    eligible_to_promote = []
+    for row in pending_rows:
+        if row["request_status"] != "Accepted":
+            continue
+        if requires_admin_approval and not row.get("is_paid", False):
+            continue
+        eligible_to_promote.append(row)
+
+    accepted_count = len(eligible_to_promote)
     if accepted_count == 0:
         return
 
@@ -407,7 +413,7 @@ def promote_accepted_teams(session_id):
     if teams_to_promote <= 0:
         return
 
-    for team in accepted_approved[:teams_to_promote]:
+    for team in eligible_to_promote[:teams_to_promote]:
         supabase.table("registered_teams").insert(
             {
                 "session_id": session_id,
@@ -569,6 +575,35 @@ def build_matchups_table(round_matchups, team_lookup, profile_lookup):
     return build_df(rows, ["Court", "Team", "Result"])
 
 
+def get_pending_status_map(pending_rows, registered_count, booked_count, requires_admin_approval):
+    max_teams = booked_count * 2
+    available_slots = max_teams - registered_count
+
+    eligible_rows = []
+    status_map = {}
+
+    for row in pending_rows:
+        if row["request_status"] != "Accepted":
+            status_map[row["id"]] = "Pending Partner Request"
+        elif requires_admin_approval and not row.get("is_paid", False):
+            status_map[row["id"]] = "Pending Admin Approval"
+        else:
+            eligible_rows.append(row)
+
+    if eligible_rows:
+        if available_slots <= 0:
+            for row in eligible_rows:
+                status_map[row["id"]] = "Not Enough Booked Courts"
+        elif registered_count % 2 == 0 and len(eligible_rows) % 2 == 1:
+            for row in eligible_rows:
+                status_map[row["id"]] = "Odd Number of Teams"
+        else:
+            for row in eligible_rows:
+                status_map[row["id"]] = "Not Enough Booked Courts"
+
+    return status_map
+
+
 # =========================
 # Page setup
 # =========================
@@ -591,6 +626,7 @@ is_admin = current_user_email == "epcepress@gmail.com"
 
 session_date_str = str(session["session_date"])
 about_acknowledged = profile_lookup.get(user_id, {}).get("about_acknowledged", False)
+requires_admin_approval = bool(session.get("requires_admin_approval", False))
 
 now_dt = now_phoenix()
 today_str = now_dt.date().isoformat()
@@ -612,19 +648,13 @@ with st.sidebar:
         st.session_state.edit_profile = True
         st.switch_page("pages/2_Create_Account.py")
 
+    if st.button("Refresh"):
+        st.rerun()
+
     if st.button("Logout"):
-        import extra_streamlit_components as stx
-
-        cookie_manager = stx.CookieManager()
-        cookie_manager.delete("pb_refresh_token")
-
-        try:
-            supabase.auth.sign_out()
-        except Exception:
-            pass
-
-        st.session_state.clear()
+        st.session_state["perform_logout"] = True
         st.switch_page("app.py")
+        st.stop()
 
 st.title(f"Session: {session_date_str} - {format_time_12h(session['start_time'])}")
 
@@ -703,7 +733,7 @@ if view == "About":
     A team moves from **Pending** to **Registered** only when:
 
     1. The partner request is **Accepted**
-    2. The team is marked as **Approved**
+    2. The team is marked as **Approved** when admin approval is required
     3. There is available court capacity
     4. Team counts follow pairing rules (no odd promotions unless necessary)
 
@@ -815,7 +845,7 @@ if view == "About":
 # Registration view
 # =========================
 elif view == "Registration":
-    promote_accepted_teams(session_id)
+    promote_accepted_teams(session_id, requires_admin_approval)
 
     if registration_locked:
         st.warning("Registration is closed. The session has started.")
@@ -855,7 +885,7 @@ elif view == "Registration":
             .eq("user_id", user_id)
             .execute()
         )
-        promote_accepted_teams(session_id)
+        promote_accepted_teams(session_id, requires_admin_approval)
         st.rerun()
 
     if action_col4.button("Withdraw", use_container_width=True, disabled=registration_locked):
@@ -881,20 +911,55 @@ elif view == "Registration":
 
         st.session_state["show_register"] = False
         st.session_state["show_add_court"] = False
-        promote_accepted_teams(session_id)
+        promote_accepted_teams(session_id, requires_admin_approval)
         st.rerun()
+
+    pending = (
+        supabase.table("pending_teams")
+        .select("*")
+        .eq("session_id", session_id)
+        .order("created_at")
+        .execute()
+        .data
+    )
+
+    if is_admin and requires_admin_approval:
+        accepted_unapproved = [
+            row for row in pending
+            if row["request_status"] == "Accepted" and not row.get("is_paid", False)
+        ]
+
+        if accepted_unapproved:
+            team_label_to_id = {}
+            team_labels = []
+
+            for row in accepted_unapproved:
+                label = f"{get_full_name(row['player_1_id'], profile_lookup)} / {get_full_name(row['player_2_id'], profile_lookup)}"
+                team_labels.append(label)
+                team_label_to_id[label] = row["id"]
+
+            selected_unapproved_team = st.selectbox(
+                "Accepted unapproved team",
+                ["Select team"] + team_labels,
+            )
+
+            if st.button("Approve Team", disabled=registration_locked):
+                if registration_locked:
+                    st.error("Registration is closed.")
+                    st.stop()
+
+                if selected_unapproved_team != "Select team":
+                    (
+                        supabase.table("pending_teams")
+                        .update({"is_paid": True})
+                        .eq("id", team_label_to_id[selected_unapproved_team])
+                        .execute()
+                    )
+                    promote_accepted_teams(session_id, requires_admin_approval)
+                    st.rerun()
 
     if st.session_state["show_register"] and not registration_locked:
         registered_rows = get_active_registered_teams(session_id)
-
-        accepted_rows = (
-            supabase.table("pending_teams")
-            .select("*")
-            .eq("session_id", session_id)
-            .eq("request_status", "Accepted")
-            .execute()
-            .data
-        )
 
         unavailable_ids = set()
 
@@ -902,9 +967,10 @@ elif view == "Registration":
             unavailable_ids.add(r["player_1_id"])
             unavailable_ids.add(r["player_2_id"])
 
-        for r in accepted_rows:
-            unavailable_ids.add(r["player_1_id"])
-            unavailable_ids.add(r["player_2_id"])
+        for r in pending:
+            if r["request_status"] == "Accepted":
+                unavailable_ids.add(r["player_1_id"])
+                unavailable_ids.add(r["player_2_id"])
 
         eligible_partners = {
             pid: get_full_name(pid, profile_lookup)
@@ -989,7 +1055,7 @@ elif view == "Registration":
                         }
                     ).execute()
 
-            promote_accepted_teams(session_id)
+            promote_accepted_teams(session_id, requires_admin_approval)
             st.session_state["show_register"] = False
             st.rerun()
 
@@ -1012,7 +1078,7 @@ elif view == "Registration":
                     }
                 ).execute()
 
-                promote_accepted_teams(session_id)
+                promote_accepted_teams(session_id, requires_admin_approval)
                 st.rerun()
         else:
             st.info("No courts available.")
@@ -1083,6 +1149,7 @@ elif view == "Registration":
                     .execute()
                 )
 
+                promote_accepted_teams(session_id, requires_admin_approval)
                 st.rerun()
 
             if col2.button("Reject", key=f"reject_{req['id']}", disabled=registration_locked):
@@ -1129,40 +1196,15 @@ elif view == "Registration":
         .data
     )
 
-    if is_admin:
-        accepted_unapproved = [
-            row for row in pending
-            if row["request_status"] == "Accepted" and not row.get("is_paid", False)
-        ]
+    registered = get_active_registered_teams(session_id)
+    courts = get_booked_courts(session_id)
 
-        if accepted_unapproved:
-            team_label_to_id = {}
-            team_labels = []
-
-            for row in accepted_unapproved:
-                label = f"{get_full_name(row['player_1_id'], profile_lookup)} / {get_full_name(row['player_2_id'], profile_lookup)}"
-                team_labels.append(label)
-                team_label_to_id[label] = row["id"]
-
-            selected_unapproved_team = st.selectbox(
-                "Accepted unapproved team",
-                ["Select team"] + team_labels,
-            )
-
-            if st.button("Approve Team", disabled=registration_locked):
-                if registration_locked:
-                    st.error("Registration is closed.")
-                    st.stop()
-
-                if selected_unapproved_team != "Select team":
-                    (
-                        supabase.table("pending_teams")
-                        .update({"is_paid": True})
-                        .eq("id", team_label_to_id[selected_unapproved_team])
-                        .execute()
-                    )
-                    promote_accepted_teams(session_id)
-                    st.rerun()
+    pending_status_map = get_pending_status_map(
+        pending_rows=pending,
+        registered_count=len(registered),
+        booked_count=len(courts),
+        requires_admin_approval=requires_admin_approval,
+    )
 
     st.subheader("Pending Teams")
     st.table(
@@ -1171,15 +1213,13 @@ elif view == "Registration":
                 {
                     "Player 1": get_full_name(r["player_1_id"], profile_lookup),
                     "Player 2": get_full_name(r["player_2_id"], profile_lookup),
-                    "Request": r["request_status"],
+                    "Status": pending_status_map.get(r["id"], ""),
                 }
                 for r in pending
             ],
-            ["Player 1", "Player 2", "Request"],
+            ["Player 1", "Player 2", "Status"],
         )
     )
-
-    registered = get_active_registered_teams(session_id)
 
     st.subheader("Registered Teams")
     st.table(
@@ -1194,8 +1234,6 @@ elif view == "Registration":
             ["Player 1", "Player 2"],
         )
     )
-
-    courts = get_booked_courts(session_id)
 
     st.subheader("Booked Courts")
     st.table(
@@ -1392,6 +1430,7 @@ elif view == "Admin":
     st.write(f"Date: {session_date_str}")
     st.write(f"Start Time: {format_time_12h(session['start_time'])}")
     st.write(f"Rounds: {max_rounds}")
+    st.write(f"Admin Approval: {'Yes' if requires_admin_approval else 'No'}")
 
     st.markdown("### Clear Current Session")
     st.caption("This clears registration, courts, rounds, and matchups for the current session.")
@@ -1462,6 +1501,8 @@ elif view == "Admin":
             step=1,
         )
 
+        requires_admin_approval_new = st.checkbox("Admin Approval", value=False)
+
         create_session = st.form_submit_button("Create New Session")
 
     if create_session:
@@ -1478,6 +1519,7 @@ elif view == "Admin":
                     "session_date": new_session_date.isoformat(),
                     "start_time": start_time_24,
                     "number_of_rounds": int(new_session_rounds),
+                    "requires_admin_approval": requires_admin_approval_new,
                 }
             )
             .execute()
