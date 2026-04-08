@@ -627,18 +627,11 @@ is_admin = current_user_email == "epcepress@gmail.com"
 session_date_str = str(session["session_date"])
 about_acknowledged = profile_lookup.get(user_id, {}).get("about_acknowledged", False)
 requires_admin_approval = bool(session.get("requires_admin_approval", False))
+session_started = bool(session.get("session_started", False))
 
-now_dt = now_phoenix()
-today_str = now_dt.date().isoformat()
-
-session_start_dt = parse_session_start(session["session_date"], session["start_time"]).replace(
-    tzinfo=ZoneInfo("America/Phoenix")
-)
-
-session_started = now_dt >= session_start_dt
-matchups_available = session_started
-registration_locked = now_dt >= session_start_dt
 max_rounds = int(session.get("number_of_rounds") or 7)
+matchups_available = session_started
+registration_locked = session_started
 
 with st.sidebar:
     st.subheader("Profile")
@@ -666,7 +659,7 @@ if is_admin:
 default_view = "Registration"
 if not about_acknowledged:
     default_view = "About"
-elif today_str == session_date_str and session_started:
+elif session_started:
     default_view = "Matchups"
 
 if "home_view" not in st.session_state or st.session_state["home_view"] not in nav_options:
@@ -682,10 +675,6 @@ view = st.radio(
 
 if not about_acknowledged and view != "About":
     st.warning("Please read and acknowledge the About page before using Registration or Matchups.")
-    st.stop()
-
-if about_acknowledged and view == "Matchups" and not matchups_available:
-    st.warning("Matchups will be available at the session start time.")
     st.stop()
 
 # =========================
@@ -738,7 +727,7 @@ if view == "About":
     3. There is available court capacity
     4. Team counts follow pairing rules (no odd promotions unless necessary)
 
-    Once registered, teams remain registered for the session.
+    Once the admin starts the session, registration is locked.
 
     ---
 
@@ -846,7 +835,8 @@ if view == "About":
 # Registration view
 # =========================
 elif view == "Registration":
-    promote_accepted_teams(session_id, requires_admin_approval)
+    if not session_started:
+        promote_accepted_teams(session_id, requires_admin_approval)
 
     if registration_locked:
         st.warning("Registration is closed. The session has started.")
@@ -924,7 +914,7 @@ elif view == "Registration":
         .data
     )
 
-    if is_admin and requires_admin_approval:
+    if is_admin and requires_admin_approval and not registration_locked:
         accepted_unapproved = [
             row for row in pending
             if row["request_status"] == "Accepted" and not row.get("is_paid", False)
@@ -1254,6 +1244,24 @@ elif view == "Registration":
 # Matchups view
 # =========================
 elif view == "Matchups":
+    if not matchups_available:
+        st.warning("Matchups will be available when the Admin starts the session.")
+
+        if is_admin:
+            if st.button("Start Session", type="primary"):
+                (
+                    supabase.table("sessions")
+                    .update({"session_started": True})
+                    .eq("id", session_id)
+                    .execute()
+                )
+
+                promote_accepted_teams(session_id, requires_admin_approval)
+                generate_round(session_id, 1)
+                st.rerun()
+
+        st.stop()
+
     maybe_generate_rounds(session_id, max_rounds)
 
     rounds = get_existing_rounds(session_id)
@@ -1432,11 +1440,17 @@ elif view == "Admin":
     st.write(f"Start Time: {format_time_12h(session['start_time'])}")
     st.write(f"Rounds: {max_rounds}")
     st.write(f"Admin Approval: {'Yes' if requires_admin_approval else 'No'}")
+    st.write(f"Started: {'Yes' if session_started else 'No'}")
 
-    st.markdown("### Clear Current Session")
-    st.caption("This clears registration, courts, rounds, and matchups for the current session.")
+    st.session_state.setdefault("show_edit_session", False)
 
-    if st.button("Clear Session", type="primary"):
+    button_col1, button_col2 = st.columns(2)
+
+    if button_col1.button("Edit Session", use_container_width=True):
+        st.session_state["show_edit_session"] = not st.session_state["show_edit_session"]
+        st.rerun()
+
+    if button_col2.button("Clear Session", type="primary", use_container_width=True):
         (
             supabase.table("matchups")
             .delete()
@@ -1479,10 +1493,114 @@ elif view == "Admin":
             .execute()
         )
 
+        (
+            supabase.table("sessions")
+            .update({"session_started": False})
+            .eq("id", session_id)
+            .execute()
+        )
+
         st.session_state["show_register"] = False
         st.session_state["show_add_court"] = False
+        st.session_state["show_edit_session"] = False
         st.success("Current session cleared.")
         st.rerun()
+
+    if st.session_state.get("show_edit_session", False):
+        st.markdown("### Edit Session")
+
+        with st.form("edit_session_form"):
+            edit_session_date = st.date_input(
+                "Session date",
+                value=date.fromisoformat(str(session["session_date"])),
+                key="edit_session_date",
+            )
+
+            existing_time = str(session["start_time"]).split(".")[0]
+            existing_hour_24 = int(existing_time[:2])
+            existing_minute = existing_time[3:5]
+
+            if existing_hour_24 == 0:
+                edit_hour_12 = 12
+                edit_ampm = "AM"
+            elif existing_hour_24 < 12:
+                edit_hour_12 = existing_hour_24
+                edit_ampm = "AM"
+            elif existing_hour_24 == 12:
+                edit_hour_12 = 12
+                edit_ampm = "PM"
+            else:
+                edit_hour_12 = existing_hour_24 - 12
+                edit_ampm = "PM"
+
+            time_col1, time_col2, time_col3 = st.columns(3)
+            edit_session_hour = time_col1.selectbox(
+                "Hour",
+                list(range(1, 13)),
+                index=list(range(1, 13)).index(edit_hour_12),
+                key="edit_session_hour",
+            )
+            edit_session_minute = time_col2.selectbox(
+                "Minute",
+                ["00", "30"],
+                index=["00", "30"].index(existing_minute),
+                key="edit_session_minute",
+            )
+            edit_session_ampm = time_col3.selectbox(
+                "AM/PM",
+                ["AM", "PM"],
+                index=["AM", "PM"].index(edit_ampm),
+                key="edit_session_ampm",
+            )
+
+            edit_session_rounds = st.number_input(
+                "Number of rounds",
+                min_value=1,
+                max_value=20,
+                value=max_rounds,
+                step=1,
+                key="edit_session_rounds",
+            )
+
+            edit_requires_admin_approval = st.checkbox(
+                "Admin Approval",
+                value=requires_admin_approval,
+                key="edit_requires_admin_approval",
+            )
+
+            edit_started = st.checkbox(
+                "Session Started",
+                value=session_started,
+                key="edit_started",
+            )
+
+            save_session_changes = st.form_submit_button("Save Session Changes")
+
+        if save_session_changes:
+            hour_24 = edit_session_hour % 12
+            if edit_session_ampm == "PM":
+                hour_24 += 12
+
+            updated_start_time = f"{hour_24:02d}:{int(edit_session_minute):02d}:00"
+
+            (
+                supabase.table("sessions")
+                .update(
+                    {
+                        "session_date": edit_session_date.isoformat(),
+                        "start_time": updated_start_time,
+                        "number_of_rounds": int(edit_session_rounds),
+                        "requires_admin_approval": edit_requires_admin_approval,
+                        "session_started": edit_started,
+                    }
+                )
+                .eq("id", session_id)
+                .execute()
+            )
+
+            st.session_state["show_edit_session"] = False
+            st.success("Session updated.")
+            st.rerun()
 
     st.markdown("### Create New Session")
 
@@ -1521,6 +1639,7 @@ elif view == "Admin":
                     "start_time": start_time_24,
                     "number_of_rounds": int(new_session_rounds),
                     "requires_admin_approval": requires_admin_approval_new,
+                    "session_started": False,
                 }
             )
             .execute()
